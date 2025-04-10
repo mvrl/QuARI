@@ -1,0 +1,14 @@
+dropout: 0.0
+embedding_dim: 512
+extractor_model: openai/clip-vit-large-patch14
+extractor_type: clip
+freeze_extractors: false
+hidden_dim: 768
+learning_rate: 0.0001
+nhead: 8
+num_denoising_steps: 8
+num_encoder_layers: 6
+scale_factor: 0.1
+temperature: 0.07
+use_residual: false
+weight_decay: 1.0e-05

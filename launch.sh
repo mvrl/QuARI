@@ -1,0 +1,12 @@
+python train.py \
+    --json_path /u/ericx003/data/coco/coco_dataset/annotations/train_captions.json \
+    --image_dir /u/ericx003/data/coco/coco_dataset/ \
+    --extractor_type clip \
+    --extractor_model openai/clip-vit-base-patch32 \
+    --batch_size 128 \
+    --num_denoising_steps 4 \
+    --learning_rate 1e-4 \
+    --temperature 0.07 \
+    --output_dir ./clip-vit-base-patch32 \
+    --num_encoder_layers 2 \
+    --freeze_extractors
