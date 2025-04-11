@@ -66,7 +66,7 @@ class SimpleTextImageDataset(Dataset):
         Returns:
             Dictionary with keys:
             - query_text: Text query
-            - query_image: Positive image tensor
+            - target_image: Positive image tensor
         """
         item = self.data[idx]
         
@@ -80,7 +80,7 @@ class SimpleTextImageDataset(Dataset):
         
         return {
             "query_text": query_text,
-            "query_image": image_tensor
+            "target_image": image_tensor
         }
 
 
@@ -132,7 +132,7 @@ class PrecomputedEmbeddingsDataset(Dataset):
         """
         item = {
             "text_features": self.data["text_embeddings"][idx],
-            "query_image_features": self.data["image_embeddings"][idx]
+            "target_image_features": self.data["image_embeddings"][idx]
         }
         
         if self.has_query_texts:

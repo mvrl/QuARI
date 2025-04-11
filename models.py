@@ -4,9 +4,11 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from typing import Dict, List, Tuple, Optional, Any, Union
 import numpy as np
+import math
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 
 from feature_extractors import FeatureExtractorFactory
-from transformer_hypernetwork import TransformerHypernetwork
+from transformer_hypernetwork import TransformerHypernetwork, ColumnWiseTransformerHypernetwork
 
 
 class PersonalizedRetrievalModule(pl.LightningModule):
@@ -21,8 +23,8 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         embedding_dim: int = 512,
         hidden_dim: int = 768,
         num_denoising_steps: int = 4,
-        learning_rate: float = 1e-4,
-        weight_decay: float = 1e-5,
+        learning_rate: float = 5e-4,
+        weight_decay: float = 1e-2,
         temperature: float = 0.07,
         use_residual: bool = False,
         freeze_extractors: bool = True,
@@ -31,7 +33,15 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         num_encoder_layers: int = 6,
         dropout: float = 0.1,
         # Diffusion parameters
-        scale_factor: float = 0.1
+        scale_factor: float = 0.1,
+        # Learning rate schedule parameters
+        warmup_pct: float = 0.1,
+        min_lr_factor: float = 0.05,
+        # Column-wise transformer parameters
+        column_wise: bool = True,
+        matrix_sequence_len: int = 4,
+        low_rank_dim: int = 64,
+        using_precomputed_features: bool = True
     ):
         """
         Initialize the personalized retrieval module.
@@ -51,99 +61,105 @@ class PersonalizedRetrievalModule(pl.LightningModule):
             num_encoder_layers: Number of transformer encoder layers
             dropout: Dropout rate
             scale_factor: Scale factor for diffusion noise and updates
+            warmup_pct: Percentage of training steps for warmup
+            min_lr_factor: Minimum learning rate as a factor of max learning rate
+            column_wise: Whether to use column-wise transformer
+            matrix_sequence_len: Length of sequence for matrix representation
+            low_rank_dim: Dimension for low-rank matrix factorization
         """
         super().__init__()
         self.save_hyperparameters()
         
-        # Create feature extractor
-        self.feature_extractor = FeatureExtractorFactory.create_extractor(
-            extractor_type=extractor_type,
-            model_name=extractor_model,
-            device="cuda" if torch.cuda.is_available() else "cpu"
-        )
 
-        self.feature_extractor.model.to(self.device)
+        if not using_precomputed_features:
+            # Create feature extractor
+            self.feature_extractor = FeatureExtractorFactory.create_extractor(
+                extractor_type=extractor_type,
+                model_name=extractor_model,
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+            self.feature_extractor.model.to(self.device)
+        else:
+            # Use precomputed features
+            self.feature_extractor = None
         
         # Update embedding dimension based on feature extractor
-        self.embedding_dim = self.feature_extractor.feature_dim
+        self.embedding_dim = self.feature_extractor.feature_dim if self.feature_extractor else 768
         
         # Create transformer hypernetwork for personalized transformation
-        self.hypernetwork = TransformerHypernetwork(
-            embedding_dim=self.embedding_dim,
-            hidden_dim=hidden_dim,
-            num_denoising_steps=num_denoising_steps,
-            nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            dropout=dropout,
-            use_residual=use_residual,
-            scale_factor=scale_factor
-        )
+        # Use column-wise transformer if specified
+        if column_wise:
+            print("Using column-wise transformer hypernetwork")
+            self.hypernetwork = ColumnWiseTransformerHypernetwork(
+                embedding_dim=self.embedding_dim,
+                hidden_dim=hidden_dim,
+                num_denoising_steps=num_denoising_steps,
+                nhead=nhead,
+                num_encoder_layers=num_encoder_layers,
+                dropout=dropout,
+                use_residual=use_residual,
+                scale_factor=scale_factor,
+                matrix_sequence_len=matrix_sequence_len,
+                low_rank_dim=low_rank_dim
+            )
+        else:
+            print("Using row-wise transformer hypernetwork")
+            self.hypernetwork = TransformerHypernetwork(
+                embedding_dim=self.embedding_dim,
+                hidden_dim=hidden_dim,
+                num_denoising_steps=num_denoising_steps,
+                nhead=nhead,
+                num_encoder_layers=num_encoder_layers,
+                dropout=dropout,
+                use_residual=use_residual,
+                scale_factor=scale_factor
+            )
         
         # Freeze feature extractors if specified
-        if freeze_extractors:
+        if freeze_extractors and self.feature_extractor is not None:
+            self.feature_extractor.model.eval()
             for param in self.feature_extractor.parameters():
                 param.requires_grad = False
                 
         # Temperature parameter for contrastive loss
         self.temperature = temperature
         
+        # Learning rate schedule parameters
+        self.warmup_pct = warmup_pct
+        self.min_lr_factor = min_lr_factor
+        
     def forward(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the model.
         
         Args:
-            batch: Batch dictionary containing 'query_text', 'query_image', and 'negative_images'
+            batch: Batch dictionary containing 'query_text', 'target_image'
             
         Returns:
             Dictionary containing computed embeddings and matrices
         """
+
+        if "negative_images" in batch:
+            raise ValueError("wrong")
+
         # Extract features
-        if "text_features" in batch and "query_image_features" in batch:
+        if "text_features" in batch and "target_image_features" in batch:
             # Use precomputed features if available
             text_features = batch["text_features"]
-            query_image_features = batch["query_image_features"]
-            neg_image_features = batch.get("neg_image_features", None)
+            target_image_features = batch["target_image_features"]
         else:
             # Extract features from raw inputs
             query_text = batch["query_text"]
-            query_image = batch["query_image"]
-            negative_images = batch.get("negative_images", None)
+            target_image = batch["target_image"]
             
             # Extract features
             text_features = self.feature_extractor.extract_text_features(query_text)
-            query_image_features = self.feature_extractor.extract_image_features(query_image)
-            
-            # Process negative images if present
-            neg_image_features = None
-            if negative_images is not None:
-                if isinstance(negative_images, list):
-                    # Handle batch of lists of varying lengths
-                    all_neg_features = []
-                    for neg_batch in negative_images:
-                        neg_features = self.feature_extractor.extract_image_features(neg_batch)
-                        all_neg_features.append(neg_features)
-                        
-                    # Pad to same length for batching
-                    max_negs = max(len(neg) for neg in all_neg_features)
-                    padded_neg_features = []
-                    for neg_features in all_neg_features:
-                        if len(neg_features) < max_negs:
-                            padding = torch.zeros(
-                                max_negs - len(neg_features),
-                                neg_features.shape[1],
-                                device=neg_features.device
-                            )
-                            neg_features = torch.cat([neg_features, padding], dim=0)
-                        padded_neg_features.append(neg_features)
-                        
-                    neg_image_features = torch.stack(padded_neg_features)
-                else:
-                    # Handle tensor input
-                    neg_image_features = self.feature_extractor.extract_image_features(negative_images)
+            target_image_features = self.feature_extractor.extract_image_features(query_image)
+        
         
         # Generate personalization matrix
-        personalization_matrix, intermediate_matrices = self.hypernetwork(
-            text_features, return_all_steps=True
+        personalization_matrix = self.hypernetwork(
+            text_features, return_all_steps=False
         )
         
         # Apply personalization to text features
@@ -160,14 +176,16 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         
         # Normalize
         personalized_text = F.normalize(personalized_text, dim=-1)
-        
+
+
+        #compute personalized image features
+        personalized_image_features = torch.bmm(target_image_features.unsqueeze(1), personalization_matrix).squeeze(1)
+        personalized_image_features = F.normalize(personalized_image_features, dim=-1)
+
         return {
-            "text_features": text_features,
             "personalized_text": personalized_text,
-            "query_image_features": query_image_features,
-            "neg_image_features": neg_image_features,
-            "personalization_matrix": personalization_matrix,
-            "intermediate_matrices": intermediate_matrices
+            "personalized_image_features": personalized_image_features,
+            "personalization_matrix": personalization_matrix
         }
     
     def compute_loss(self, outputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -180,62 +198,29 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         Returns:
             Dictionary of computed losses
         """
-        personalized_text = outputs["personalized_text"]
-        query_image_features = outputs["query_image_features"]
-        neg_image_features = outputs["neg_image_features"]
+
+        personalized_text_features = outputs["personalized_text"]
+        personalized_image_features = outputs["personalized_image_features"]
         personalization_matrix = outputs["personalization_matrix"]
         
         losses = {}
+
+        # Compute contrastive loss
+        batch_size = personalized_text_features.shape[0]
+        logits = torch.matmul(personalized_text_features, personalized_image_features.t()) / self.temperature
+        labels = torch.arange(batch_size, device=logits.device)
         
-        # Compute similarity between personalized text and positive image
-        pos_similarity = F.cosine_similarity(personalized_text, query_image_features, dim=1)
+        loss_t2i = F.cross_entropy(logits, labels)
+        loss_i2t = F.cross_entropy(logits.t(), labels)
         
-        # Compute similarity between personalized text and negative images
-        if neg_image_features is not None:
-            if neg_image_features.dim() == 3:
-                # Multiple negative images per query
-                batch_size, num_negs, feat_dim = neg_image_features.shape
-                neg_similarity = torch.bmm(
-                    personalized_text.unsqueeze(1),
-                    neg_image_features.view(batch_size, num_negs, feat_dim).transpose(1, 2)
-                ).squeeze(1)
-            else:
-                # One negative image per query
-                neg_similarity = F.cosine_similarity(personalized_text, neg_image_features, dim=1)
-        
-            # Scale by temperature
-            pos_similarity = pos_similarity / self.temperature
-            neg_similarity = neg_similarity / self.temperature
-            
-            # Compute contrastive loss
-            if neg_similarity.dim() == 2:
-                # Multiple negatives per query
-                all_similarities = torch.cat([pos_similarity.unsqueeze(1), neg_similarity], dim=1)
-                labels = torch.zeros(all_similarities.shape[0], dtype=torch.long, device=all_similarities.device)
-                contrastive_loss = F.cross_entropy(all_similarities, labels)
-            else:
-                # One negative per query
-                all_similarities = torch.stack([pos_similarity, neg_similarity], dim=1)
-                labels = torch.zeros(all_similarities.shape[0], dtype=torch.long, device=all_similarities.device)
-                contrastive_loss = F.cross_entropy(all_similarities, labels)
-        else:
-            # Only positive similarity available, use MSE loss to increase it
-            contrastive_loss = F.mse_loss(pos_similarity, torch.ones_like(pos_similarity))
-        
+        contrastive_loss = (loss_t2i + loss_i2t) / 2.0
         losses["contrastive_loss"] = contrastive_loss
         losses["total_loss"] = contrastive_loss
         
-        # Add similarity metrics
-        if neg_image_features is not None:
-            losses["pos_similarity"] = pos_similarity.mean()
-            losses["neg_similarity"] = neg_similarity.mean() if neg_similarity.dim() == 1 else neg_similarity.mean(dim=1).mean()
-        
-        # Add orthogonality metric (for monitoring purposes only)
+        # Compute orthogonality loss for monitoring
         batch_size = personalization_matrix.shape[0]
         identity = torch.eye(personalization_matrix.shape[1], device=personalization_matrix.device)
         identity = identity.unsqueeze(0).expand_as(personalization_matrix)
-        
-        # Compute orthogonality metric (how close W^T W is to identity)
         WtW = torch.bmm(personalization_matrix.transpose(1, 2), personalization_matrix)
         ortho_metric = F.mse_loss(WtW, identity)
         losses["orthogonality"] = ortho_metric
@@ -265,6 +250,11 @@ class PersonalizedRetrievalModule(pl.LightningModule):
             self.log("train_pos_sim", losses["pos_similarity"])
             self.log("train_neg_sim", losses["neg_similarity"])
         
+        # Log learning rate
+        if self.trainer.is_global_zero:
+            lr = self.trainer.optimizers[0].param_groups[0]['lr']
+            self.log("learning_rate", lr, prog_bar=True)
+        
         return losses["total_loss"]
     
     def validation_step(self, batch: Dict[str, Any], batch_idx: int) -> None:
@@ -287,15 +277,42 @@ class PersonalizedRetrievalModule(pl.LightningModule):
             self.log("val_pos_sim", losses["pos_similarity"])
             self.log("val_neg_sim", losses["neg_similarity"])
     
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        """
-        Configure optimizer for training.
-        
-        Returns:
-            Configured optimizer
-        """
-        return torch.optim.AdamW(
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay
         )
+        
+        # Get total number of training steps
+        if self.trainer.max_steps > 0:
+            max_steps = self.trainer.max_steps
+        else:
+            # Calculate from epochs
+            if hasattr(self.trainer, 'estimated_stepping_batches'):
+                max_steps = self.trainer.estimated_stepping_batches
+            else:
+                # Fallback
+                max_steps = len(self.trainer.datamodule.train_dataloader()) * self.trainer.max_epochs
+        
+        # Create a PyTorch built-in scheduler
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.hparams.learning_rate,
+            total_steps=max_steps,
+            pct_start=self.warmup_pct,
+            div_factor=25,
+            final_div_factor=1/(self.min_lr_factor),
+            three_phase=False
+        )
+        
+        # Return the configuration with proper scheduler dict
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "name": "lr"
+            }
+        }

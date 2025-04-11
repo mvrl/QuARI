@@ -49,9 +49,15 @@ class OpenAICLIPFeatureExtractor(BaseFeatureExtractor):
         self.model_name = model_name
         self.device = device
 
-        from transformers import CLIPProcessor, CLIPModel
+        from transformers import CLIPProcessor, CLIPModel, CLIPImageProcessor
         self.model = CLIPModel.from_pretrained(model_name)
-        self.processor = CLIPProcessor.from_pretrained(model_name)
+        
+        # Create processor with rescaling disabled
+        image_processor = CLIPImageProcessor.from_pretrained(model_name, do_rescale=False)
+        self.processor = CLIPProcessor.from_pretrained(
+            model_name,
+            image_processor=image_processor
+        )
 
         if hasattr(self.model, "text_projection"):
             self._feature_dim = self.model.text_projection.out_features
@@ -60,7 +66,7 @@ class OpenAICLIPFeatureExtractor(BaseFeatureExtractor):
 
     def extract_image_features(self, images: torch.Tensor) -> torch.Tensor:
         images = images.to(self.device)
-        inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+        inputs = self.processor(images=images, return_tensors="pt", do_rescale=False).to(self.device)
         image_features = self.model.get_image_features(**inputs)
         return F.normalize(image_features, dim=-1)
 
@@ -71,7 +77,7 @@ class OpenAICLIPFeatureExtractor(BaseFeatureExtractor):
 
     @property
     def feature_dim(self) -> int:
-        return self._feature_dim
+        return 768 #self._feature_dim
 
 
 class OpenCLIPFeatureExtractor(BaseFeatureExtractor):

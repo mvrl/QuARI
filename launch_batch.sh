@@ -1,4 +1,20 @@
-python train.py \
+#!/bin/bash
+#SBATCH --job-name=./slurm_outputs/column_wise_transformer_vit_large
+#SBATCH --output=./slurm_outputs/column_wise_transformer_vit_large.log
+#SBATCH --error=./slurm_outputs/column_wise_transformer_vit_large.log
+#SBATCH --time=2-00:00:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --account bebk-tgirails 
+#SBATCH --gpu-bind=closest
+
+source activate /u/ericx003/conda/envs/vis-lang
+cd /u/ericx003/code/e2e-hypernet
+
+srun python train.py \
     --json_path /u/ericx003/data/coco/coco_dataset/annotations/train_captions.json \
     --image_dir /u/ericx003/data/coco/coco_dataset/ \
     --extractor_type clip \
