@@ -66,12 +66,7 @@ def precompute_embeddings(data_module, extractor, output_path, batch_size=1024):
                 all_image_embeddings.append(image_features.cpu())
                 all_query_texts.extend(query_texts)
             except RuntimeError as e:
-                if 'out of memory' in str(e):
-                    print(f"OOM in batch {i}, skipping...")
-                    torch.cuda.empty_cache()
-                    continue
-                else:
-                    raise
+                raise e
     
     # Concatenate
     text_embeddings = torch.cat(all_text_embeddings, dim=0)
@@ -97,16 +92,16 @@ class PrecomputedDataModule(pl.LightningDataModule):
     
     def __init__(
         self,
+        feature_extractor,
         json_path: str,
         image_dir: str,
-        extractor_type: str,
-        extractor_model: str,
         batch_size: int = 1024,
         num_workers: int = 10,
         shuffle: bool = True,
         max_samples: Optional[int] = None,
         precomputed_dir: str = "./precomputed_embeddings",
-        force_recompute: bool = False
+        force_recompute: bool = False,
+        resize_resolution: Optional[int] = 224,
     ):
         super().__init__()
         self.json_path = json_path
@@ -117,10 +112,7 @@ class PrecomputedDataModule(pl.LightningDataModule):
         self.max_samples = max_samples
         self.precomputed_dir = precomputed_dir
         self.force_recompute = force_recompute
-        
-        # Feature extractor details
-        self.extractor_type = extractor_type
-        self.extractor_model = extractor_model
+        self.resize_resolution = resize_resolution
         
         # Create raw data module for precomputation
         self.raw_data_module = SimpleDataModule(
@@ -129,20 +121,17 @@ class PrecomputedDataModule(pl.LightningDataModule):
             batch_size=batch_size,
             num_workers=num_workers,
             shuffle=shuffle,
-            max_samples=max_samples
+            max_samples=max_samples,
+            resize_resolution=self.resize_resolution,
         )
         
         # Create feature extractor
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.feature_extractor = FeatureExtractorFactory.create_extractor(
-            extractor_type=extractor_type,
-            model_name=extractor_model,
-            device=device
-        )
+        self.feature_extractor = feature_extractor.to(device)
         
         # Paths for precomputed embeddings
         os.makedirs(precomputed_dir, exist_ok=True)
-        model_name = extractor_model.replace("/", "_")
+        model_name = feature_extractor.model_name.replace("/", "_")
         self.train_embeddings_path = os.path.join(
             precomputed_dir, f"train_{model_name}.pt"
         )
@@ -225,6 +214,7 @@ class SimpleDataModule(pl.LightningDataModule):
         num_workers: int = 10,
         shuffle: bool = True,
         max_samples: Optional[int] = None,
+        resize_resolution: Optional[int] = 224,
     ):
         """
         Initialize the data module.
@@ -244,6 +234,8 @@ class SimpleDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.shuffle = shuffle
         self.max_samples = max_samples
+        self.resize_resolution = resize_resolution
+
     
     def setup(self, stage: Optional[str] = None):
         """
@@ -256,6 +248,8 @@ class SimpleDataModule(pl.LightningDataModule):
             json_path=self.json_path,
             image_dir=self.image_dir,
             max_samples=self.max_samples,
+            resize_resolution=self.resize_resolution,
+
         )
 
         val_path = self.json_path.replace("train", "val")
@@ -264,6 +258,7 @@ class SimpleDataModule(pl.LightningDataModule):
                 json_path=val_path,
                 image_dir=self.image_dir,
                 max_samples=self.max_samples,
+                resize_resolution=self.resize_resolution,
             )
     
     def train_dataloader(self) -> DataLoader:
@@ -296,8 +291,8 @@ def parse_args():
     # Dataset arguments
     parser.add_argument("--json_path", type=str, required=True, help="Path to JSON file with text-image pairs")
     parser.add_argument("--image_dir", type=str, required=True, help="Directory containing images")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
-    parser.add_argument("--num_workers", type=int, default=10, help="Number of workers for dataloaders")
+    parser.add_argument("--batch_size", type=int, default=320, help="Batch size")
+    parser.add_argument("--num_workers", type=int, default=20, help="Number of workers for dataloaders")
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to use")
     
     # Precomputed embeddings arguments
@@ -309,9 +304,7 @@ def parse_args():
                         help="Force recomputation of embeddings")
     
     # Feature extractor arguments
-    parser.add_argument("--extractor_type", type=str, default="clip", choices=["clip", "siglip", "siglip2"], 
-                        help="Type of feature extractor")
-    parser.add_argument("--extractor_model", type=str, default="openai/clip-vit-base-patch32", 
+    parser.add_argument("--extractor", type=str, default="openai/clip-vit-base-patch32", 
                         help="Model name for feature extractor")
     parser.add_argument("--freeze_extractors", action="store_true", 
                         help="Whether to freeze feature extractors")
@@ -329,21 +322,19 @@ def parse_args():
                         help="Number of transformer encoder layers")
     parser.add_argument("--dropout", type=float, default=0.0,
                         help="Dropout rate")
-    parser.add_argument("--scale_factor", type=float, default=0.1,
-                        help="Scale factor for diffusion noise and updates")
     parser.add_argument("--matrix_sequence_len", type=int, default=4,
                         help="Length of sequence for matrix reshaping")
     parser.add_argument("--low_rank_dim", type=int, default=64,
-                        help="Dimension for low-rank matrix factorization")
-    parser.add_argument("--column_wise", action="store_true", default=True,
-                        help="Use column-wise processing (default: True)")
-    
+                        help="Dimension for low-rank matrix factorization")    
+    parser.add_argument("--separate_decoders", default=True, type=bool,
+                        help="Whether to use separate decoders for query and gallery")
+
     # Training arguments
     parser.add_argument("--learning_rate", type=float, default=5e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay")
     parser.add_argument("--temperature", type=float, default=0.07, 
                         help="Temperature for contrastive loss")
-    parser.add_argument("--max_epochs", type=int, default=30, help="Maximum number of epochs")
+    parser.add_argument("--max_epochs", type=int, default=10, help="Maximum number of epochs")
     parser.add_argument("--patience", type=int, default=5, 
                         help="Patience for early stopping")
     parser.add_argument("--precision", type=str, default="16-mixed", 
@@ -352,6 +343,7 @@ def parse_args():
                         help="Gradient clipping value")
     parser.add_argument("--accumulate_grad_batches", type=int, default=2,
                         help="Number of batches to accumulate gradients")
+    
     
     # Output arguments
     parser.add_argument("--output_dir", type=str, default="./outputs", 
@@ -377,21 +369,26 @@ def main():
         save_dir=os.path.join(args.output_dir, "logs"),
         name=args.experiment_name
     )
-    
+
+    feature_extractor = FeatureExtractorFactory.create_extractor(
+                            model_name=args.extractor
+                        )
+    resize_resolution = feature_extractor.input_resolution
+
     # Use precomputed embeddings if specified
     if args.use_precomputed:
         print("Using precomputed embeddings for memory efficiency")
         data_module = PrecomputedDataModule(
+            feature_extractor=feature_extractor,
             json_path=args.json_path,
             image_dir=args.image_dir,
-            extractor_type=args.extractor_type,
-            extractor_model=args.extractor_model,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             shuffle=True,
             max_samples=args.max_samples,
             precomputed_dir=args.precomputed_dir,
-            force_recompute=args.force_recompute
+            force_recompute=args.force_recompute,
+            resize_resolution=resize_resolution,
         )
     else:
         print("Using on-the-fly feature extraction (may require more memory)")
@@ -401,17 +398,19 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             shuffle=True,
-            max_samples=args.max_samples
+            max_samples=args.max_samples,
+            resize_resolution=resize_resolution,
+
         )
     
         # Prepare data (if using precomputed embeddings)
     if args.use_precomputed:
         data_module.prepare_data()
 
+
     # Create model
     model = PersonalizedRetrievalModule(
-        extractor_type=args.extractor_type,
-        extractor_model=args.extractor_model,
+        feature_extractor = feature_extractor,
         hidden_dim=args.hidden_dim,
         num_denoising_steps=args.num_denoising_steps,
         learning_rate=args.learning_rate,
@@ -423,11 +422,11 @@ def main():
         nhead=args.nhead,
         num_encoder_layers=args.num_encoder_layers,
         dropout=args.dropout,
-        # Diffusion parameters
-        scale_factor=args.scale_factor,
         # Additional parameters for column-wise approach
-        matrix_sequence_len=args.matrix_sequence_len,
-        low_rank_dim=args.low_rank_dim
+        low_rank_dim=args.low_rank_dim,
+        using_precomputed_features=args.use_precomputed,
+        use_separate_decoders=args.separate_decoders,
+
     )
     
     # # Enable gradient checkpointing for transformers if available
@@ -443,7 +442,7 @@ def main():
         filename="model-{epoch:02d}-{val_loss:.3e}",
         monitor="val_loss",
         mode="min",
-        save_top_k=3,
+        save_top_k=5,
         save_last=True,
     )
     
@@ -464,14 +463,13 @@ def main():
         accelerator="auto",
         devices="auto",
         log_every_n_steps=20,
-        val_check_interval=750,
+        val_check_interval=500,
         gradient_clip_val=args.gradient_clip_val,
         accumulate_grad_batches=args.accumulate_grad_batches,
     )
     
     # Enable high precision matmul
     torch.set_float32_matmul_precision("high")
-    
     
     # Train model
     try:
@@ -481,16 +479,6 @@ def main():
         print(f"Model checkpoints saved to: {checkpoint_callback.dirpath}")
         print(f"Best model path: {checkpoint_callback.best_model_path}")
     except RuntimeError as e:
-        if 'out of memory' in str(e):
-            print("\n\nERROR: CUDA out of memory. Try these options:")
-            print("1. Use --use_precomputed flag to precompute embeddings")
-            print("2. Reduce --batch_size (try halving it)")
-            print("3. Reduce --hidden_dim (try 256 instead of 512)")
-            print("4. Reduce --matrix_sequence_len (try 8 instead of 16)")
-            print("5. Reduce --num_encoder_layers (try 1 instead of 2)")
-            print("6. Reduce --nhead (try 2 instead of 4)")
-            raise
-        else:
             raise e
 
 
