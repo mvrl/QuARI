@@ -2,38 +2,69 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Union, List, Tuple
+from typing import Dict, Any, Optional, Tuple
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import List, Dict, Any, Optional
-
-
-def scaled_positional_encoding(batch_seq: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int, max_period: int = 10000) -> torch.Tensor:
     """
-    Adds positional encoding to a batched sequence.
-    batch_seq: [batch, seq_len, hidden_dim]
-    pe: [max_len, hidden_dim]
+    Sinusoidal timestep embeddings (from denoising diffusion models).
+    
+    Args:
+        timesteps: 1D tensor of timestep indices [B] or scalar
+        embedding_dim: Dimension of the embedding
+        max_period: Maximum period for sinusoidal encoding
+    
+    Returns:
+        Embedding tensor [B, embedding_dim]
+    """
+    half_dim = embedding_dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half_dim, dtype=torch.float32, device=timesteps.device) / half_dim
+    )
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if embedding_dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+
+def scaled_positional_encoding(batch_seq: torch.Tensor, pe: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """
+    Adds positional encoding to a batched sequence with optional scaling.
+    
+    Args:
+        batch_seq: [batch, seq_len, hidden_dim]
+        pe: [max_len, hidden_dim]
+        scale: Scaling factor for positional encoding
+    
+    Returns:
+        Sequence with positional encoding added
     """
     seq_len = batch_seq.size(1)
-    return batch_seq + pe[:seq_len].unsqueeze(0)
+    return batch_seq + scale * pe[:seq_len].unsqueeze(0)
 
 
-class ColumnWiseTransformerHypernetwork(nn.Module):
+class ImprovedTransformerHypernetwork(nn.Module):
     """
-    Predicts square low-rank projectors W_text and W_img via shared U/V tokens
-    and separate two-layer MLP decoders.
-
-    Inputs:
-      - query_emb: [B, E] text/query embeddings
-    Outputs (dict):
-      - 'W_text': [B, E, E]
-      - 'W_img' : [B, E, E]
-    If return_all, also returns 'all': List[Dict[str, Tensor]]
+    Improved hypernetwork that:
+    - Generates only W_image (more efficient for text-to-image retrieval)
+    - Refines the query embedding through the condition token
+    - Uses sinusoidal step embeddings for better gradient flow
+    
+    Architecture:
+        Input: query_emb [B, E]
+        ↓
+        Query Encoder → ctx [B, H]
+        ↓
+        Iterative Refinement (T steps):
+            - ctx refined through transformer
+            - U/V tokens refined through transformer
+        ↓
+        Outputs:
+            - refined_query [B, E]: Decoded from final ctx
+            - W_image [B, E, E]: Low-rank matrix for image transformation
     """
+    
     def __init__(
         self,
         embedding_dim: int,
@@ -43,37 +74,57 @@ class ColumnWiseTransformerHypernetwork(nn.Module):
         nhead: int = 8,
         num_layers: int = 4,
         dropout: float = 0.1,
-        use_separate_decoders: bool = True,
+        query_residual_weight: float = 0.5,
     ):
+        """
+        Args:
+            embedding_dim: Dimension of input embeddings (e.g., 1024 for SigLIP2-large)
+            low_rank_dim: Rank for low-rank factorization (default: 64)
+            hidden_dim: Hidden dimension for transformer (default: 512)
+            num_steps: Number of iterative refinement steps (default: 4)
+            nhead: Number of attention heads (default: 8)
+            num_layers: Number of transformer encoder layers (default: 4)
+            dropout: Dropout rate (default: 0.1)
+            query_residual_weight: Weight for residual connection in query refinement (default: 0.5)
+        """
         super().__init__()
         self.E = embedding_dim
         self.r = low_rank_dim
         self.H = hidden_dim
         self.num_steps = num_steps
-        self.use_separate_decoders = use_separate_decoders
-
-        # Query conditioning
+        self.query_residual_weight = query_residual_weight
+        
+        # Query encoder: Projects query embedding to hidden space
         self.query_encoder = nn.Sequential(
             nn.Linear(self.E, self.H),
             nn.LayerNorm(self.H),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(self.H, self.H),
             nn.LayerNorm(self.H)
         )
-
-        # Step embedding
-        self.step_embedding = nn.Embedding(num_steps, self.H)
-
-        # Positional encodings
-        seq_len = 2 * self.r + 1
+        
+        # Step embedding: Maps step index to hidden dimension
+        # Using sinusoidal encoding for better gradient flow
+        self.step_proj = nn.Sequential(
+            nn.Linear(self.H, self.H),
+            nn.GELU(),
+            nn.Linear(self.H, self.H)
+        )
+        
+        # Positional encodings for U/V tokens
+        seq_len = 2 * self.r + 1  # condition + u_tokens + v_tokens
         pe = torch.zeros(seq_len, self.H)
-        pos = torch.arange(seq_len).unsqueeze(1)
-        div = torch.exp(torch.arange(0, self.H, 2) * (-math.log(10000.0) / self.H))
+        pos = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, self.H, 2, dtype=torch.float) * (-math.log(10000.0) / self.H))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer('pos_emb', pe)
-
-        # Transformer encoder
+        
+        # Learnable positional embedding scaling (allows model to adjust importance)
+        self.pos_scale = nn.Parameter(torch.ones(1) * 0.1)  # Start small, can grow
+        
+        # Transformer encoder: Refines all tokens through self-attention
         layer = nn.TransformerEncoderLayer(
             d_model=self.H,
             nhead=nhead,
@@ -81,137 +132,219 @@ class ColumnWiseTransformerHypernetwork(nn.Module):
             dropout=dropout,
             activation='gelu',
             batch_first=True,
-            norm_first=True
+            norm_first=True  # Pre-norm architecture (more stable)
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers)
+        
+        # Decoder for refined query embedding from condition token
+        self.query_decoder = nn.Sequential(
+            nn.Linear(self.H, self.H),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.H, self.E)
+        )
+        
+        # Decoders for U and V matrices (image transformation only)
+        self.dec_u_img = nn.Sequential(
+            nn.Linear(self.H, self.H),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.H, self.E)
+        )
+        
+        self.dec_v_img = nn.Sequential(
+            nn.Linear(self.H, self.H),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.H, self.E)
+        )
+        
 
-        # Two-layer MLP decoders
-        def make_decoder():
-            return nn.Sequential(
-                nn.Linear(self.H, self.H),
-                nn.GELU(),
-                nn.Linear(self.H, self.E)
-            )
-        if self.use_separate_decoders:
-            self.dec_u_text = make_decoder()
-            self.dec_v_text = make_decoder()
-            self.dec_u_img  = make_decoder()
-            self.dec_v_img  = make_decoder()
-        else:
-            self.dec_u = make_decoder()
-            self.dec_v = make_decoder()
 
     def forward(
         self,
         query_emb: torch.Tensor,
         return_all: bool = False
     ) -> Dict[str, Any]:
+        """
+        Forward pass through the hypernetwork.
+        
+        Args:
+            query_emb: Query embeddings [B, E]
+            return_all: If True, return intermediate steps
+        
+        Returns:
+            Dictionary containing:
+                - 'refined_query': Refined query embedding [B, E]
+                - 'W_image': Image transformation matrix [B, E, E]
+                - 'all': (optional) List of intermediate outputs
+        """
         B, E = query_emb.shape
         device = query_emb.device
-
-        # Encode query
+        
+        # Encode query to hidden space
         ctx = self.query_encoder(query_emb)  # [B, H]
-
-        # Initialize shared tokens (zeros)
+        
+        # Initialize U and V tokens (will be refined iteratively)
         u_tok = torch.zeros(B, self.r, self.H, device=device)
         v_tok = torch.zeros(B, self.r, self.H, device=device)
-
-        all_steps: Optional[List[Dict[str, torch.Tensor]]] = [] if return_all else None
+        
+        # Store intermediate results if requested
+        all_steps = [] if return_all else None
         if return_all:
-            zero = torch.zeros(B, E, E, device=device)
-            all_steps.append({'W_text': zero.clone(), 'W_img': zero.clone()})
-
-        # Iterative refinement
+            initial_query = self.query_decoder(ctx)
+            initial_query = query_emb + self.query_residual_weight * initial_query
+            initial_query = F.normalize(initial_query, dim=-1)
+            all_steps.append({
+                'refined_query': initial_query,
+                'W_image': torch.eye(E, device=device).unsqueeze(0).expand(B, -1, -1)
+            })
+        
+        # Iterative refinement loop
         for t in range(self.num_steps):
-            # Condition token
+            # Create step embedding (sinusoidal encoding)
             step_idx = torch.full((B,), t, device=device, dtype=torch.long)
-            cond = (ctx + self.step_embedding(step_idx)).unsqueeze(1)  # [B,1,H]
-
-            # Add positional encoding
-            u_seq = scaled_positional_encoding(u_tok, self.pos_emb)
-            v_seq = scaled_positional_encoding(v_tok, self.pos_emb)
-
+            step_emb = get_timestep_embedding(step_idx, self.H)
+            step_emb = self.step_proj(step_emb)
+            
+            # Update condition token with step information
+            cond = (ctx + step_emb).unsqueeze(1)  # [B, 1, H]
+            
+            # Add positional encodings to U/V tokens with learned scaling
+            u_seq = scaled_positional_encoding(u_tok, self.pos_emb, scale=self.pos_scale)
+            v_seq = scaled_positional_encoding(v_tok, self.pos_emb, scale=self.pos_scale)
+            
             # Build sequence: [cond, U-tokens, V-tokens]
-            seq = torch.cat([cond, u_seq, v_seq], dim=1)  # [B,1+2r,H]
-            out = self.transformer(seq)  # [B,1+2r,H]
-            delta = out[:, 1:, :]
-
-            # Split and update tokens
+            seq = torch.cat([cond, u_seq, v_seq], dim=1)  # [B, 1+2r, H]
+            
+            # Transform through transformer (all tokens attend to each other)
+            out = self.transformer(seq)  # [B, 1+2r, H]
+            
+            # Extract outputs
+            ctx_out = out[:, 0, :]  # Updated condition token
+            delta = out[:, 1:, :]   # Updates for U/V tokens
+            
+            # Split deltas for U and V
             d_u = delta[:, :self.r, :]
             d_v = delta[:, self.r:, :]
-            u_tok = u_tok + d_u
-            v_tok = v_tok + d_v
-
+            
+            # Update tokens with residual connection
+            ctx = ctx + ctx_out  # Refine context
+            u_tok = u_tok + d_u  # Refine U tokens
+            v_tok = v_tok + d_v  # Refine V tokens
+            
+            # Store intermediate results if requested
             if return_all:
-                Wt, Wi = self._decode_and_proj(u_tok, v_tok)
-                all_steps.append({'W_text': Wt, 'W_image': Wi})
-
-        # Final decode & projection
-        W_text, W_img = self._decode_and_proj(u_tok, v_tok)
-        out: Dict[str, Any] = {'W_text': W_text, 'W_image': W_img}
+                query_refined = self.query_decoder(ctx)
+                query_refined = query_emb + self.query_residual_weight * query_refined
+                query_refined = F.normalize(query_refined, dim=-1)
+                
+                W_img = self._decode_and_form_matrix(u_tok, v_tok)
+                all_steps.append({
+                    'refined_query': query_refined,
+                    'W_image': W_img
+                })
+        
+        # Final decoding
+        # Decode refined query from final condition token
+        query_delta = self.query_decoder(ctx)
+        
+        refined_query = query_delta + self.query_residual_weight * query_emb
+        refined_query = F.normalize(refined_query, dim=-1)  # Ensure unit norm
+        
+        # Form image transformation matrix from U/V tokens
+        W_image = self._decode_and_form_matrix(u_tok, v_tok)
+        output = {
+            'refined_query': refined_query,
+            'W_image': W_image
+        }
+        
         if return_all:
-            out['all'] = all_steps
-        return out
-
-    def _decode_and_proj(
+            output['all'] = all_steps
+        
+        return output
+    
+    def _decode_and_form_matrix(
         self,
         u_tok: torch.Tensor,
         v_tok: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Decode tokens into U_text, V_text and U_img, V_img, then form W = U @ V^T.
-        u_tok, v_tok: [B, r, H]
+        Decode U/V tokens and form transformation matrix via low-rank factorization.
+        
+        W = I + scale * (U @ V^T)
+        
+        Identity anchoring ensures:
+        - W starts near identity (no transformation)
+        - Learns as a perturbation from identity
+        - More stable and interpretable transforms
+        
+        Args:
+            u_tok: U tokens [B, r, H]
+            v_tok: V tokens [B, r, H]
+        
         Returns:
-          W_text: [B, E, E], W_img: [B, E, E]
+            W_image: Transformation matrix [B, E, E]
         """
-        # Decode columns
+        # Decode tokens to embedding dimension
+        u_cols = self.dec_u_img(u_tok)  # [B, r, E]
+        v_cols = self.dec_v_img(v_tok)  # [B, r, E]
+        
+        # Transpose to [B, E, r]
+        U = u_cols.transpose(1, 2)
+        V = v_cols.transpose(1, 2)
+        
+        # Form low-rank perturbation: Delta = U @ V^T
+        Delta = torch.bmm(U, V.transpose(1, 2))  # [B, E, E]
+        B, E, _ = Delta.shape
 
-        if self.use_separate_decoders:
-            ut_cols = self.dec_u_text(u_tok)  # [B, r, E]
-            vt_cols = self.dec_v_text(v_tok)
-            ui_cols = self.dec_u_img(u_tok)
-            vi_cols = self.dec_v_img(v_tok)
-
-            # Transpose to [B, E, r]
-            U_t = ut_cols.transpose(1, 2)
-            V_t = vt_cols.transpose(1, 2)
-            U_i = ui_cols.transpose(1, 2)
-            V_i = vi_cols.transpose(1, 2)
-
-            # Compute W = U @ V^T
-            W_text = torch.bmm(U_t, V_t.transpose(1, 2))
-            W_img  = torch.bmm(U_i, V_i.transpose(1, 2))
-        else:
-            u_cols = self.dec_u(u_tok)
-            v_cols = self.dec_v(v_tok)
-
-            # Transpose to [B, E, r]
-            U = u_cols.transpose(1, 2)
-            V = v_cols.transpose(1, 2)
-
-            # Compute W = U @ V^T
-            W = torch.bmm(U, V.transpose(1, 2))
-            
-            W_text = W
-            W_img = W
-
-        return W_text, W_img
-
+        I = torch.eye(E, device=Delta.device, dtype=Delta.dtype).unsqueeze(0).expand(B, -1, -1)
+        W_image = I + 0.03 * Delta
+        
+        return W_image
+    
     def project_and_score(
         self,
         query_emb: torch.Tensor,
         img_emb: torch.Tensor
     ) -> torch.Tensor:
         """
-        Applies W_text and W_img, computes cosine similarities.
+        Apply transformations and compute similarity scores.
+        
+        Args:
+            query_emb: Query embeddings [B, E] or [B, N, E]
+            img_emb: Image embeddings [B, E] or [B, M, E]
+        
+        Returns:
+            Similarity scores
         """
+        # Forward pass
         out = self.forward(query_emb)
-        q_proj = torch.bmm(query_emb.unsqueeze(1), out['W_text']).squeeze(1)
-        q_proj = F.normalize(q_proj, dim=-1)
-        if img_emb.dim() == 3:
-            img_proj = torch.matmul(img_emb, out['W_img'])
-            sim = F.cosine_similarity(q_proj.unsqueeze(1), img_proj, dim=-1)
+        
+        # Get refined query and transformation matrix
+        refined_query = out['refined_query']  # [B, E]
+        W_image = out['W_image']              # [B, E, E]
+        
+        # Transform images
+        if img_emb.dim() == 2:
+            # Single image per query: [B, E]
+            img_transformed = torch.bmm(
+                img_emb.unsqueeze(1),
+                W_image
+            ).squeeze(1)  # [B, E]
+            img_transformed = F.normalize(img_transformed, dim=-1)
+            
+            # Compute similarity
+            similarity = F.cosine_similarity(refined_query, img_transformed, dim=-1)
         else:
-            img_proj = torch.matmul(img_emb, out['W_img']).squeeze(1)
-            sim = F.cosine_similarity(q_proj, img_proj, dim=-1)
-        return sim
+            # Multiple images per query: [B, M, E]
+            img_transformed = torch.bmm(img_emb, W_image)  # [B, M, E]
+            img_transformed = F.normalize(img_transformed, dim=-1)
+            
+            # Compute similarity
+            similarity = torch.einsum('be,bme->bm', refined_query, img_transformed)
+        
+        return similarity
+
+
+
