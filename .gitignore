@@ -1,0 +1,7 @@
+__pycache__/
+ckpts/
+eval_results/
+*.log
+hf_prep.py
+upload_hf.py
+ilias/
