@@ -75,6 +75,9 @@ class OpenAICLIPFeatureExtractor(BaseFeatureExtractor):
         super().__init__()
         self.model_name, self.device = model_name, device
 
+        self._prefer_bf16 = _bf16_ok(device)
+
+        
         from transformers import CLIPProcessor, CLIPModel
         self.processor = CLIPProcessor.from_pretrained(model_name)          # default normalisation
         self.model     = CLIPModel.from_pretrained(model_name).to(device).eval()
