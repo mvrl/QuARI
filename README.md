@@ -5,6 +5,12 @@ Official implementation of QuARI from NeurIPS 2025.
 ## Setup
 
 ```bash
+conda env create -f env.yml
+conda activate dev_base
+```
+
+Or install manually:
+```bash
 pip install torch torchvision pytorch-lightning
 pip install transformers open_clip_torch webdataset
 pip install faiss-gpu pillow tqdm

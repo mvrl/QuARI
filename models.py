@@ -189,15 +189,25 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         batch_size = personalized_text_features.shape[0]
         device = personalized_text_features.device
         
-        logits = torch.matmul(personalized_text_features, personalized_image_features.t()) / self.temperature
+        W_image = outputs.get("W_image")
+        target_image_features = batch["target_image_features"].to(device)
+        
+        batch_images_transformed = torch.bmm(
+            target_image_features.unsqueeze(0).expand(batch_size, -1, -1),
+            W_image
+        )
+        batch_images_transformed = F.normalize(batch_images_transformed, dim=-1)
+        
+        logits = torch.bmm(
+            personalized_text_features.unsqueeze(1),
+            batch_images_transformed.transpose(1, 2)
+        ).squeeze(1) / self.temperature
         
         has_semipositives = "semipositive_embeddings" in batch and batch["semipositive_embeddings"] is not None
         
         if has_semipositives:
             semipos_embeddings = batch["semipositive_embeddings"].to(device)
             semipos_weights = batch["semipositive_weights"].to(device)
-            
-            W_image = outputs.get("W_image")
             
             semipos_transformed = torch.bmm(semipos_embeddings, W_image)
             semipos_transformed = F.normalize(semipos_transformed, dim=-1)
@@ -215,14 +225,16 @@ class PersonalizedRetrievalModule(pl.LightningModule):
             log_probs = F.log_softmax(all_logits, dim=1)
             loss_text_to_image = -(alpha * log_probs).sum() / batch_size
             
-            labels = torch.arange(batch_size, device=device)
-            loss_image_to_text = F.cross_entropy(logits.t(), labels)
+            diagonal_sims = (personalized_image_features * personalized_text_features).sum(dim=1) / self.temperature
+            loss_image_to_text = -diagonal_sims.mean()
             
             contrastive_loss = (loss_text_to_image + loss_image_to_text) / 2
         else:
             labels = torch.arange(batch_size, device=device)
             loss_text_to_image = F.cross_entropy(logits, labels)
-            loss_image_to_text = F.cross_entropy(logits.t(), labels)
+            
+            diagonal_sims = (personalized_image_features * personalized_text_features).sum(dim=1) / self.temperature
+            loss_image_to_text = -diagonal_sims.mean()
             contrastive_loss = (loss_text_to_image + loss_image_to_text) / 2
         
         losses["contrastive_loss"] = contrastive_loss
