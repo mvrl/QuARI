@@ -117,57 +117,27 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         Forward pass through the model.
         
         Args:
-            batch: Batch dictionary containing 'query_text', 'target_image'
+            batch: Batch dictionary containing text and image features
             
         Returns:
-            Dictionary containing computed embeddings and matrices
+            Dictionary containing refined query and transformation matrix
         """
         
         text_features = batch["text_features"]
-        target_image_features = batch["target_image_features"]
 
-        #check for nan or inf
         if torch.isnan(text_features).any() or torch.isinf(text_features).any():
             raise ValueError("Text features contain NaN or Inf values.")
 
-        # Generate personalization matrix
-        outputs = self.hypernetwork(
-            text_features, return_all=False
-        )
-
-        W_text = outputs["W_text"]
+        outputs = self.hypernetwork(text_features, return_all=False)
+        
+        refined_query = outputs["refined_query"]
         W_image = outputs["W_image"]
 
-
-        # Check for NaN or Inf in personalization matrices
-        if torch.isnan(W_text).any() or torch.isinf(W_text).any():
-            raise ValueError("W_text contains NaN or Inf values.")
         if torch.isnan(W_image).any() or torch.isinf(W_image).any():
             raise ValueError("W_image contains NaN or Inf values.")
-        
-        # Apply personalization to text features
-        if self.use_residual:
-            personalized_text = text_features + torch.bmm(
-                text_features.unsqueeze(1),
-                W_text
-            ).squeeze(1)
-        else:
-            personalized_text = torch.bmm(
-                text_features.unsqueeze(1),
-                W_text
-            ).squeeze(1)
-        
-        # Normalize
-        personalized_text = F.normalize(personalized_text, dim=-1)
-
-        #compute personalized image features
-        personalized_image_features = torch.bmm(target_image_features.unsqueeze(1), W_image).squeeze(1)
-        personalized_image_features = F.normalize(personalized_image_features, dim=-1)
 
         return {
-            "personalized_text": personalized_text,
-            "personalized_image_features": personalized_image_features,
-            "W_text": W_text,
+            "refined_query": refined_query,
             "W_image": W_image,
         }
     
@@ -175,21 +145,36 @@ class PersonalizedRetrievalModule(pl.LightningModule):
         """
         Compute contrastive loss with semi-positive samples (Equation 10 from paper).
         
+        Each query i transforms all images with its own W_image[i]:
+        - In-batch images: image[j] @ W_image[i] for all j
+        - Semi-positives: semipos[i, k] @ W_image[i] for all k
+        
         Args:
-            outputs: Outputs from the forward pass
-            batch: Input batch containing semi-positive information
+            outputs: Contains 'refined_query' [B, E] and 'W_image' [B, E, E]
+            batch: Contains 'target_image_features' [B, E] and optionally semi-positives
             
         Returns:
             Dictionary of computed losses
         """
-        personalized_text_features = outputs["personalized_text"]
-        personalized_image_features = outputs["personalized_image_features"]
+        refined_query = outputs["refined_query"]
+        W_image = outputs["W_image"]
+        target_image_features = batch["target_image_features"]
         
-        losses = {}
-        batch_size = personalized_text_features.shape[0]
-        device = personalized_text_features.device
+        batch_size = refined_query.shape[0]
+        device = refined_query.device
         
-        logits = torch.matmul(personalized_text_features, personalized_image_features.t()) / self.temperature
+        target_image_features = target_image_features.to(device)
+        
+        batch_images_transformed = torch.bmm(
+            target_image_features.unsqueeze(0).expand(batch_size, -1, -1),
+            W_image
+        )
+        batch_images_transformed = F.normalize(batch_images_transformed, dim=-1)
+        
+        logits = torch.bmm(
+            refined_query.unsqueeze(1),
+            batch_images_transformed.transpose(1, 2)
+        ).squeeze(1) / self.temperature
         
         has_semipositives = "semipositive_embeddings" in batch and batch["semipositive_embeddings"] is not None
         
@@ -197,13 +182,11 @@ class PersonalizedRetrievalModule(pl.LightningModule):
             semipos_embeddings = batch["semipositive_embeddings"].to(device)
             semipos_weights = batch["semipositive_weights"].to(device)
             
-            W_image = outputs.get("W_image")
-            
             semipos_transformed = torch.bmm(semipos_embeddings, W_image)
             semipos_transformed = F.normalize(semipos_transformed, dim=-1)
             
             semipos_logits = torch.bmm(
-                personalized_text_features.unsqueeze(1),
+                refined_query.unsqueeze(1),
                 semipos_transformed.transpose(1, 2)
             ).squeeze(1) / self.temperature
             
@@ -215,18 +198,23 @@ class PersonalizedRetrievalModule(pl.LightningModule):
             log_probs = F.log_softmax(all_logits, dim=1)
             loss_text_to_image = -(alpha * log_probs).sum() / batch_size
             
-            labels = torch.arange(batch_size, device=device)
-            loss_image_to_text = F.cross_entropy(logits.t(), labels)
+            positive_sims = (refined_query * batch_images_transformed[:, torch.arange(batch_size), :]).sum(dim=1)
+            loss_image_to_text = -positive_sims.mean() / self.temperature
             
             contrastive_loss = (loss_text_to_image + loss_image_to_text) / 2
         else:
             labels = torch.arange(batch_size, device=device)
             loss_text_to_image = F.cross_entropy(logits, labels)
-            loss_image_to_text = F.cross_entropy(logits.t(), labels)
+            
+            positive_sims = (refined_query * batch_images_transformed[:, torch.arange(batch_size), :]).sum(dim=1)
+            loss_image_to_text = -positive_sims.mean() / self.temperature
+            
             contrastive_loss = (loss_text_to_image + loss_image_to_text) / 2
         
-        losses["contrastive_loss"] = contrastive_loss
-        losses["total_loss"] = contrastive_loss
+        losses = {
+            "contrastive_loss": contrastive_loss,
+            "total_loss": contrastive_loss
+        }
         
         return losses
     
