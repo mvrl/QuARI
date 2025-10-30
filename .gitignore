@@ -5,3 +5,4 @@ eval_results/
 hf_prep.py
 upload_hf.py
 ilias/
+*.txt

@@ -323,7 +323,8 @@ class PrecomputedEmbeddingsDataset(Dataset):
         embeddings_path: str,
         transform: Optional[Callable] = None,
         pattern: str = "*.pt",
-        lazy_load: bool = False
+        lazy_load: bool = False,
+        semipositives_path: Optional[str] = None
     ):
         """
         Initialize precomputed embeddings dataset.
@@ -333,6 +334,7 @@ class PrecomputedEmbeddingsDataset(Dataset):
             transform: Optional transform to apply to items
             pattern: Glob pattern for chunk files (if embeddings_path is a directory)
             lazy_load: If True and loading from directory, use lazy loading (memory efficient)
+            semipositives_path: Optional path to semi-positive indices and weights
         """
         self.transform = transform
         embeddings_path = Path(embeddings_path)
@@ -364,6 +366,11 @@ class PrecomputedEmbeddingsDataset(Dataset):
             
             # Optional elements
             self.has_query_texts = "query_texts" in self.data
+        
+        self.semipositives_data = None
+        if semipositives_path is not None:
+            self.semipositives_data = torch.load(semipositives_path)
+            print(f"Loaded semi-positives from {semipositives_path}")
     
     def __len__(self) -> int:
         """Return the number of items in the dataset."""
@@ -386,11 +393,20 @@ class PrecomputedEmbeddingsDataset(Dataset):
         else:
             item = {
                 "text_features": self.data["text_embeddings"][idx],
-                "target_image_features": self.data["image_embeddings"][idx]
+                "target_image_features": self.data["image_embeddings"][idx],
+                "idx": idx
             }
             
             if self.has_query_texts:
                 item["query_text"] = self.data["query_texts"][idx]
+            
+            if self.semipositives_data is not None:
+                item["semipositive_embeddings"] = torch.from_numpy(
+                    self.semipositives_data['semipositive_embeddings'][idx]
+                ).float()
+                item["semipositive_weights"] = torch.from_numpy(
+                    self.semipositives_data['semipositive_weights'][idx]
+                ).float()
         
         # Apply transform if specified
         if self.transform is not None:
@@ -412,7 +428,9 @@ class EmbeddingsDataModule(pl.LightningDataModule):
         test_embeddings_path: Optional[str] = None,
         batch_size: int = 32,
         num_workers: int = 4,
-        shuffle: bool = True
+        shuffle: bool = True,
+        train_semipositives_path: Optional[str] = None,
+        val_semipositives_path: Optional[str] = None
     ):
         """
         Initialize precomputed embeddings data module.
@@ -424,6 +442,8 @@ class EmbeddingsDataModule(pl.LightningDataModule):
             batch_size: Batch size for dataloaders
             num_workers: Number of workers for dataloaders
             shuffle: Whether to shuffle the training data
+            train_semipositives_path: Path to training semi-positives file
+            val_semipositives_path: Path to validation semi-positives file
         """
         super().__init__()
         self.train_embeddings_path = train_embeddings_path
@@ -432,6 +452,8 @@ class EmbeddingsDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.shuffle = shuffle
+        self.train_semipositives_path = train_semipositives_path
+        self.val_semipositives_path = val_semipositives_path
     
     def setup(self, stage: Optional[str] = None):
         """
@@ -441,10 +463,16 @@ class EmbeddingsDataModule(pl.LightningDataModule):
             stage: Current stage ('fit', 'validate', 'test', or None)
         """
         if stage == 'fit' or stage is None:
-            self.train_dataset = PrecomputedEmbeddingsDataset(self.train_embeddings_path)
+            self.train_dataset = PrecomputedEmbeddingsDataset(
+                self.train_embeddings_path,
+                semipositives_path=self.train_semipositives_path
+            )
             
             if self.val_embeddings_path:
-                self.val_dataset = PrecomputedEmbeddingsDataset(self.val_embeddings_path)
+                self.val_dataset = PrecomputedEmbeddingsDataset(
+                    self.val_embeddings_path,
+                    semipositives_path=self.val_semipositives_path
+                )
         
         if stage == 'test' or stage is None:
             if self.test_embeddings_path:
