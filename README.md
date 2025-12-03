@@ -37,9 +37,8 @@ python cocototar.py \
 ```bash
 python precompute_embeddings.py \
     --extractor openai/clip-vit-base-patch32 \
-    --json_path ./data/train.json \
-    --image_dir ./data/images \
-    --output_path ./precomputed/train_embeds.pt
+    --output_path ./precomputed/train_embeds.pt \
+    --tar_regex '.*\.tar$'
 ```
 
 ### Step 2: Mine semi-positives
