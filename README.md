@@ -76,6 +76,10 @@ python eval_retrieval.py \
     --eval_baseline
 ```
 
+## Using Pretrained Models
+Get pretrained weights by running `download_ckpts.py`.
+
+
 ## Citation
 
 ```bibtex
