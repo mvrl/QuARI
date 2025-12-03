@@ -1,4 +1,4 @@
-# QuARI: Query Adaptive Retrieval Improvement -- NeurIPS 2025
+# QuARI: Query Adaptive Retrieval Improvement: NeurIPS 2025
 
 <div align="center">
 
