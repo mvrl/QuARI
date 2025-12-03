@@ -6,6 +6,7 @@
 [![Project Page](https://img.shields.io/badge/Project-Website-green)](https://ericx003.github.io/proj/quari/)
 [![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Models-yellow
 )](https://huggingface.co/collections/MVRL/quari)
+
 </center>
 
 ## Overview
