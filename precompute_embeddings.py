@@ -72,7 +72,6 @@ def _save_chunk(base_dir: Path, chunk_idx: int, text_buf, image_buf, text_str_bu
 
 def precompute_embeddings(
     extractor,
-    json_path,
     image_dir,
     output_path,
     batch_size=256,
@@ -86,7 +85,6 @@ def precompute_embeddings(
 
     Args:
         extractor: Feature extractor with .extract_text_features and .extract_image_features
-        json_path: Kept for backward compatibility (unused here)
         image_dir: Directory containing WebDataset shard tarfiles
         output_path: If chunk_size is None -> single .pt file.
                      If chunk_size is set -> directory to hold chunk_XXXXX.pt files.
@@ -255,7 +253,6 @@ def main():
 
     precompute_embeddings(
         extractor=extractor,
-        json_path=args.json_path,
         image_dir=args.image_dir,
         output_path=args.output_path,
         batch_size=args.batch_size,
