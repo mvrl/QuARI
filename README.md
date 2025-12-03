@@ -38,6 +38,7 @@ python cocototar.py \
 python precompute_embeddings.py \
     --extractor openai/clip-vit-base-patch32 \
     --output_path ./precomputed/train_chunks \
+    --image_dir ./data/images \
     --tar_regex '.*\.tar$' \
     --chunk_size 50000
 
