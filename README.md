@@ -9,8 +9,6 @@
 
 </center>
 </div>
-<br>
-<br>
 
 ## Overview
 Current multimodal embedding models are widely used for image-to-image and text-to-image retrieval, but their global embeddings often miss the fine-grained cues needed for challenging retrieval tasks. QuARI tackles this by learning a query-specific linear projection of a frozen backbone embedding space. A transformer hypernetwork maps each query to both an adapted query embedding and a low-rank projection matrix that is applied to all gallery embeddings, making the adaptation cheap enough to run over millions of items. Trained with a symmetric contrastive loss and additional “semi-positive” neighbors, QuARI emphasizes subspaces that are relevant to the current query while down-weighting irrelevant directions. Experiments on ILIAS and INQUIRE show that this simple query-conditioned adaptation consistently outperforms strong baselines, including static task-adapted encoders and heavyweight re-rankers, while remaining highly efficient at inference time.
