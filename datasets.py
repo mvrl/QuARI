@@ -72,23 +72,12 @@ def create_pair_dataloader(
         rank: Current GPU rank for distributed training
     """
 
-    # Image preprocessing
-    transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.CenterCrop(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                           std=[0.229, 0.224, 0.225])
-    ])
-
     if expand_pairs:
         # Expand each image to multiple (image, caption) pairs
         def process_sample(sample):
             """Process and transform a single pair."""
             # Decode image
             img = Image.open(io.BytesIO(sample['image'])).convert('RGB')
-            img = transform(img)
-
             return img, sample['caption']
 
         dataset = (
@@ -104,8 +93,6 @@ def create_pair_dataloader(
         def process_sample_all(sample):
             img_bytes = sample['jpg']
             img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-            img = transform(img)
-
             caption_data = json.loads(sample['json'].decode('utf-8'))
             return img, caption_data['captions']
 
@@ -275,8 +262,6 @@ class SimpleTextImageDataset(Dataset):
         else:
             self.transform = transforms.Compose([
                 transforms.Resize((self.resize_resolution, self.resize_resolution)),
-                # transforms.ToTensor(),
-                # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
     
     def __len__(self) -> int:
