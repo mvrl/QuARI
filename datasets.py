@@ -95,6 +95,9 @@ def create_pair_dataloader(
         rank: Current GPU rank for distributed training
     """
 
+    if return_image_ids and not expand_pairs:
+        raise ValueError("return_image_ids=True is only supported when expand_pairs=True")
+
     if expand_pairs:
         # Expand each image to multiple (image, caption) pairs
         def process_sample(sample):
