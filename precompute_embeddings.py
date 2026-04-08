@@ -42,11 +42,12 @@ def build_shard_list(tar_dir: str, tar_regex: str):
     return shard_paths
 
 
-def _save_single_file(output_path: str, text_embeddings, image_embeddings, query_texts):
+def _save_single_file(output_path: str, text_embeddings, image_embeddings, query_texts, image_ids):
     data = {
         "text_embeddings": text_embeddings,
         "image_embeddings": image_embeddings,
         "query_texts": query_texts,
+        "image_ids": image_ids,
     }
     out_dir = os.path.dirname(output_path)
     if out_dir:
@@ -56,18 +57,27 @@ def _save_single_file(output_path: str, text_embeddings, image_embeddings, query
     return output_path
 
 
-def _save_chunk(base_dir: Path, chunk_idx: int, text_buf, image_buf, text_str_buf):
+def _save_chunk(base_dir: Path, chunk_idx: int, text_buf, image_buf, text_str_buf, image_id_buf):
     text_cat = torch.cat(text_buf, dim=0)
     image_cat = torch.cat(image_buf, dim=0)
     data = {
         "text_embeddings": text_cat,
         "image_embeddings": image_cat,
         "query_texts": text_str_buf,
+        "image_ids": image_id_buf,
     }
     chunk_path = base_dir / f"chunk_{chunk_idx:05d}.pt"
     torch.save(data, chunk_path)
     print(f"  Saved chunk {chunk_idx:05d} with {len(text_str_buf)} samples to {chunk_path}")
     return len(text_str_buf)
+
+
+def _normalize_image_id(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if torch.is_tensor(value):
+        return value.item() if value.numel() == 1 else value.tolist()
+    return value
 
 
 def precompute_embeddings(
@@ -109,6 +119,7 @@ def precompute_embeddings(
         num_workers=num_workers,
         image_size=extractor.input_resolution,
         expand_pairs=True,
+        return_image_ids=True,
     )
 
     # SINGLE-FILE MODE (no chunking)
@@ -116,13 +127,15 @@ def precompute_embeddings(
         text_embeddings = []
         image_embeddings = []
         query_texts = []
+        image_ids = []
 
         processed = 0
         pbar = tqdm(desc="Extracting features", dynamic_ncols=True)
 
         with torch.no_grad():
-            for images, captions in loader:
+            for images, captions, batch_image_ids in loader:
                 texts = list(captions)
+                batch_ids = [_normalize_image_id(v) for v in list(batch_image_ids)]
                 bs = len(texts)
 
                 if max_samples is not None:
@@ -132,6 +145,7 @@ def precompute_embeddings(
                     if bs > remaining:
                         images = images[:remaining]
                         texts = texts[:remaining]
+                        batch_ids = batch_ids[:remaining]
                         bs = remaining
 
                 text_feats = extractor.extract_text_features(texts)
@@ -140,6 +154,7 @@ def precompute_embeddings(
                 text_embeddings.append(text_feats.cpu())
                 image_embeddings.append(image_feats.cpu())
                 query_texts.extend(texts)
+                image_ids.extend(batch_ids)
 
                 processed += bs
                 pbar.update(bs)
@@ -155,7 +170,7 @@ def precompute_embeddings(
         text_embeddings = torch.cat(text_embeddings, dim=0)
         image_embeddings = torch.cat(image_embeddings, dim=0)
 
-        return _save_single_file(output_path, text_embeddings, image_embeddings, query_texts)
+        return _save_single_file(output_path, text_embeddings, image_embeddings, query_texts, image_ids)
         
     base_dir = Path(output_path)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -163,6 +178,7 @@ def precompute_embeddings(
     text_buf = []
     image_buf = []
     text_str_buf = []
+    image_id_buf = []
 
     processed = 0
     total_saved = 0
@@ -171,8 +187,9 @@ def precompute_embeddings(
     pbar = tqdm(desc="Extracting features (chunked)", dynamic_ncols=True)
 
     with torch.no_grad():
-        for images, captions in loader:
+        for images, captions, batch_image_ids in loader:
             texts = list(captions)
+            batch_ids = [_normalize_image_id(v) for v in list(batch_image_ids)]
             bs = len(texts)
 
             if max_samples is not None:
@@ -182,18 +199,20 @@ def precompute_embeddings(
                 if bs > remaining:
                     images = images[:remaining]
                     texts = texts[:remaining]
+                    batch_ids = batch_ids[:remaining]
                     bs = remaining
 
             # If adding this batch would overflow the desired chunk_size,
             # flush the current buffer first (if it's non-empty).
             if text_str_buf and len(text_str_buf) + bs > chunk_size:
-                saved = _save_chunk(base_dir, chunk_idx, text_buf, image_buf, text_str_buf)
+                saved = _save_chunk(base_dir, chunk_idx, text_buf, image_buf, text_str_buf, image_id_buf)
                 total_saved += saved
                 chunk_idx += 1
 
                 text_buf = []
                 image_buf = []
                 text_str_buf = []
+                image_id_buf = []
 
             # Now add this batch to the buffer
             text_feats = extractor.extract_text_features(texts)
@@ -202,6 +221,7 @@ def precompute_embeddings(
             text_buf.append(text_feats.cpu())
             image_buf.append(image_feats.cpu())
             text_str_buf.extend(texts)
+            image_id_buf.extend(batch_ids)
 
             processed += bs
             pbar.update(bs)
@@ -211,7 +231,7 @@ def precompute_embeddings(
 
     # Flush tail
     if text_str_buf:
-        saved = _save_chunk(base_dir, chunk_idx, text_buf, image_buf, text_str_buf)
+        saved = _save_chunk(base_dir, chunk_idx, text_buf, image_buf, text_str_buf, image_id_buf)
         total_saved += saved
         chunk_idx += 1
 

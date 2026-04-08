@@ -76,6 +76,7 @@ def create_pair_dataloader(
     num_workers=4,
     image_size=224,
     expand_pairs=True,
+    return_image_ids=False,
     world_size=1,
     rank=0
 ):
@@ -89,6 +90,7 @@ def create_pair_dataloader(
         num_workers: Number of worker processes
         image_size: Size to resize images to
         expand_pairs: If True, yield (image, caption) pairs. If False, yield (image, all_captions)
+        return_image_ids: If True and expand_pairs=True, also return image_id per pair
         world_size: Total number of GPUs for distributed training
         rank: Current GPU rank for distributed training
     """
@@ -100,6 +102,8 @@ def create_pair_dataloader(
             # Decode image (support either 'image' or raw 'jpg' bytes)
             img_bytes = sample.get('image', sample.get('jpg'))
             img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            if return_image_ids:
+                return img, sample['caption'], sample.get('image_id')
             return img, sample['caption']
 
         dataset = (
