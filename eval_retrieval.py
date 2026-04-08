@@ -24,7 +24,7 @@ def load_embeddings_from_dir(embed_dir: str, pattern: str = "*.pt") -> Dict[str,
         data = torch.load(f, map_location='cpu')
         all_text.append(data['text_embeddings'])
         all_image.append(data['image_embeddings'])
-        if 'image_ids' in data:
+        if has_image_ids and 'image_ids' in data:
             all_image_ids.extend(list(data['image_ids']))
         else:
             has_image_ids = False
@@ -94,7 +94,8 @@ def evaluate_retrieval(
     if distractor_embeddings is not None:
         image_embeddings = torch.cat([image_embeddings, distractor_embeddings], dim=0)
         if gallery_image_ids is not None:
-            gallery_image_ids = list(gallery_image_ids) + [None] * distractor_embeddings.shape[0]
+            distractor_sentinel = object()
+            gallery_image_ids = list(gallery_image_ids) + [distractor_sentinel] * distractor_embeddings.shape[0]
     
     n_queries = text_embeddings.shape[0]
     n_images = image_embeddings.shape[0]
@@ -135,7 +136,8 @@ def evaluate_baseline(
     if distractor_embeddings is not None:
         image_embeddings = torch.cat([image_embeddings, distractor_embeddings], dim=0)
         if gallery_image_ids is not None:
-            gallery_image_ids = list(gallery_image_ids) + [None] * distractor_embeddings.shape[0]
+            distractor_sentinel = object()
+            gallery_image_ids = list(gallery_image_ids) + [distractor_sentinel] * distractor_embeddings.shape[0]
     
     similarities = torch.matmul(text_embeddings, image_embeddings.t())
     recalls = compute_recall_at_k(similarities, k_values, query_image_ids, gallery_image_ids)

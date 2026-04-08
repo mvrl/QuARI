@@ -73,6 +73,7 @@ def _save_chunk(base_dir: Path, chunk_idx: int, text_buf, image_buf, text_str_bu
 
 
 def _normalize_image_id(value):
+    """Normalize image-id values from dataloader batches into Python scalars/strings."""
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     if torch.is_tensor(value):
