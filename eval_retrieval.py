@@ -28,6 +28,7 @@ def load_embeddings_from_dir(embed_dir: str, pattern: str = "*.pt") -> Dict[str,
             all_image_ids.extend(list(data['image_ids']))
         else:
             has_image_ids = False
+            all_image_ids = []
 
     output = {
         'text_embeddings': torch.cat(all_text, dim=0),

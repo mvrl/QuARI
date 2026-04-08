@@ -103,7 +103,7 @@ def create_pair_dataloader(
             img_bytes = sample.get('image', sample.get('jpg'))
             img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
             if return_image_ids:
-                return img, sample['caption'], sample.get('image_id')
+                return img, sample['caption'], sample.get('image_id', sample.get('__key__'))
             return img, sample['caption']
 
         dataset = (
