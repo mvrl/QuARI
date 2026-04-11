@@ -70,11 +70,102 @@ python train.py \
 
 ## Evaluation
 
+### Evaluating on COCO / Flickr (standard pairs)
+
 ```bash
 python eval_retrieval.py \
     --embeddings_dir ./precomputed/val \
     --checkpoint_path ./outputs/checkpoints/best.ckpt \
-    --distractor_dirs ./distractors/yfcc \
+    --eval_baseline
+```
+
+### Evaluating on ILIAS and INQUIRE
+
+ILIAS and INQUIRE use a large pool of distractor images (YFCC100M and
+iNaturalist respectively).  The evaluation workflow has two stages:
+
+**Stage 1 — compute distractor embeddings** with `compute_embeds.py`.  The
+distractor shards must be WebDataset `.tar` files where each sample contains a
+`jpg` key (image bytes) and a `__key__` identifier.
+
+```bash
+# ILIAS: YFCC100M distractors
+python compute_embeds.py \
+    --model_name openai/clip-vit-base-patch16 \
+    --shard_dir /path/to/yfcc100m/shards \
+    --out_dir ./embeds/ilias_distractors
+
+# INQUIRE: iNaturalist distractors
+python compute_embeds.py \
+    --model_name openai/clip-vit-base-patch16 \
+    --shard_dir /path/to/inaturalist/shards \
+    --out_dir ./embeds/inquire_distractors
+```
+
+**Stage 2 — compute paired query/target embeddings** for the evaluation set
+(ILIAS-core or INQUIRE queries) with `precompute_embeddings.py`.  The shards
+must contain a `jpg` key (target image) and a `json` key with
+`{"image_id": <int>, "captions": [<str>, ...]}`.
+
+```bash
+python precompute_embeddings.py \
+    --extractor openai/clip-vit-base-patch16 \
+    --image_dir /path/to/ilias_core/shards \
+    --output_path ./embeds/ilias_pairs.pt \
+    --tar_regex '.*\.tar$'
+```
+
+**Stage 3 — run retrieval evaluation**
+
+```bash
+python eval_retrieval.py \
+    --embeddings_dir ./embeds/ilias_pairs.pt \
+    --checkpoint_path ./ckpts/clip-vit-base-patch16/ \
+    --distractor_dirs ./embeds/ilias_distractors \
+    --eval_baseline
+```
+
+### Testing the pipeline with synthetic sample data
+
+`create_sample_dataset.py` generates small synthetic datasets in the correct
+formats so you can smoke-test the full pipeline without downloading large
+datasets:
+
+```bash
+# Create synthetic distractor shards (image-only, mimics YFCC100M / iNaturalist)
+python create_sample_dataset.py \
+    --mode distractors \
+    --out_dir ./sample_data/distractors \
+    --n_images 200 \
+    --n_shards 2
+
+# Create synthetic query/target pair shards (image + captions, mimics ILIAS-core / INQUIRE)
+python create_sample_dataset.py \
+    --mode pairs \
+    --out_dir ./sample_data/pairs \
+    --n_images 50 \
+    --captions_per_image 3
+
+# Compute distractor embeddings
+python compute_embeds.py \
+    --model_name openai/clip-vit-base-patch16 \
+    --shard_dir ./sample_data/distractors \
+    --out_dir ./sample_embeds/distractors \
+    --device cpu
+
+# Compute paired embeddings
+python precompute_embeddings.py \
+    --extractor openai/clip-vit-base-patch16 \
+    --image_dir ./sample_data/pairs \
+    --output_path ./sample_embeds/pairs.pt \
+    --tar_regex '.*\.tar$' \
+    --device cpu
+
+# Run retrieval evaluation
+python eval_retrieval.py \
+    --embeddings_dir ./sample_embeds \
+    --checkpoint_path ./ckpts/<model>/ \
+    --distractor_dirs ./sample_embeds/distractors \
     --eval_baseline
 ```
 

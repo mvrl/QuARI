@@ -29,6 +29,35 @@ def load_embeddings_from_dir(embed_dir: str, pattern: str = "*.pt") -> Dict[str,
     }
 
 
+def load_distractor_embeddings_from_dir(embed_dir: str, pattern: str = "*.pt") -> torch.Tensor:
+    """Load image-only embeddings produced by ``compute_embeds.py``.
+
+    Each ``.pt`` file in *embed_dir* must contain a dict with either:
+    * ``"embeddings"`` key (format written by ``compute_embeds.py``), or
+    * ``"image_embeddings"`` key (format written by ``precompute_embeddings.py``).
+
+    Returns a single concatenated tensor of shape ``[N, D]``.
+    """
+    embed_dir = Path(embed_dir)
+    files = sorted(embed_dir.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No files matching '{pattern}' found in {embed_dir}")
+
+    chunks = []
+    for f in files:
+        data = torch.load(f, map_location='cpu')
+        if 'embeddings' in data:
+            chunks.append(data['embeddings'])
+        elif 'image_embeddings' in data:
+            chunks.append(data['image_embeddings'])
+        else:
+            raise KeyError(
+                f"{f}: expected 'embeddings' or 'image_embeddings' key, "
+                f"got {list(data.keys())}"
+            )
+    return torch.cat(chunks, dim=0)
+
+
 def compute_recall_at_k(similarities: torch.Tensor, k_values: List[int]) -> Dict[str, float]:
     n_queries = similarities.shape[0]
     
@@ -127,8 +156,10 @@ def main():
         all_distractors = []
         for dist_dir in args.distractor_dirs:
             print(f"Loading distractors from {dist_dir}")
-            dist_data = load_embeddings_from_dir(dist_dir, args.pattern)
-            all_distractors.append(F.normalize(dist_data['image_embeddings'], dim=-1))
+            dist_embeds = load_distractor_embeddings_from_dir(dist_dir, args.pattern)
+            # Cast to float32: compute_embeds.py saves fp16 by default, and F.normalize
+            # requires consistent precision with the paired embeddings (fp32).
+            all_distractors.append(F.normalize(dist_embeds.float(), dim=-1))
         distractor_embeddings = torch.cat(all_distractors, dim=0)
         print(f"Loaded {distractor_embeddings.shape[0]} distractor images")
     

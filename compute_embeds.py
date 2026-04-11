@@ -1,3 +1,33 @@
+"""
+Compute image-only embeddings from a directory of WebDataset tar files.
+
+Each tar shard must contain samples with a ``jpg`` (or ``jpeg``) key and a
+``__key__`` key.  The script produces chunked ``.pt`` files, each storing:
+
+    {
+        "keys":       list[str]      — original ``__key__`` values,
+        "embeddings": Tensor[N, D]   — L2-normalised image embeddings,
+    }
+
+These files can be passed to ``eval_retrieval.py`` via ``--distractor_dirs``
+when evaluating against large distractor pools such as YFCC100M (used by
+ILIAS) or iNaturalist (used by INQUIRE).
+
+Example usage (ILIAS distractors)::
+
+    python compute_embeds.py \\
+        --model_name openai/clip-vit-base-patch16 \\
+        --shard_dir /path/to/ilias/yfcc100m \\
+        --out_dir ./ilias_embeds
+
+Example usage (INQUIRE distractors)::
+
+    python compute_embeds.py \\
+        --model_name openai/clip-vit-base-patch16 \\
+        --shard_dir /path/to/inquire/inaturalist \\
+        --out_dir ./inquire_embeds
+"""
+
 import argparse
 import os
 from pathlib import Path
@@ -8,22 +38,28 @@ import webdataset as wds
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from feature_extractors import FeatureExtractorFactory   # <-- import the file above
+from feature_extractors import FeatureExtractorFactory
 
 
 # --------------------------------------------------------------------------- #
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(
+        description="Compute and save image embeddings from WebDataset tar shards.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p.add_argument("--model_name", required=True,
-                   help='e.g. "openai/clip-vit-large-patch14" or "ViT-B-32"')
-    p.add_argument("--shard_dir", default="/u/ericx003/data/ilias/yfcc100m")
+                   help='Feature extractor, e.g. "openai/clip-vit-base-patch16"')
+    p.add_argument("--shard_dir", required=True,
+                   help="Directory containing .tar shard files with a 'jpg' key per sample")
+    p.add_argument("--out_dir", required=True,
+                   help="Directory where chunked .pt embedding files will be written")
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", choices=["fp32", "fp16"], default="fp16",
                    help="Storage dtype on disk.")
-    p.add_argument("--chunk_size", type=int, default=5000000,
-                   help="#embeddings per saved file.")
+    p.add_argument("--chunk_size", type=int, default=5_000_000,
+                   help="Maximum number of embeddings per output file.")
     return p.parse_args()
 
 
@@ -31,8 +67,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # -------- fixed output dir & safe filename stem ----------------------- #
-    out_dir = Path("./yfcc_embeds")
+    # -------- output dir & safe filename stem ----------------------------- #
+    out_dir = Path(args.out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
     stem = args.model_name.replace("/", "-")
 
