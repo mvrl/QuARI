@@ -135,15 +135,20 @@ def evaluate_baseline(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--embeddings_dir', required=True, help='Directory with paired embeddings')
-    parser.add_argument('--checkpoint_path', required=True, help='Path to QuARI checkpoint')
+    parser.add_argument('--checkpoint_path', default=None, help='Path to QuARI checkpoint (not required with --baseline_only)')
     parser.add_argument('--distractor_dirs', nargs='*', default=None, help='Directories with distractor embeddings')
     parser.add_argument('--pattern', default='*.pt', help='File pattern for embeddings')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
     parser.add_argument('--k_values', nargs='+', type=int, default=[1, 5, 10, 50], help='K values for recall')
     parser.add_argument('--device', default='cuda', help='Device')
-    parser.add_argument('--eval_baseline', action='store_true', help='Also evaluate baseline')
+    parser.add_argument('--eval_baseline', action='store_true', help='Also evaluate baseline CLIP similarity')
+    parser.add_argument('--baseline_only', action='store_true',
+                        help='Run only the baseline evaluation (no QuARI model required)')
     args = parser.parse_args()
-    
+
+    if not args.baseline_only and args.checkpoint_path is None:
+        parser.error('--checkpoint_path is required unless --baseline_only is set')
+
     print(f"Loading embeddings from {args.embeddings_dir}")
     data = load_embeddings_from_dir(args.embeddings_dir, args.pattern)
     text_embeddings = F.normalize(data['text_embeddings'], dim=-1)
@@ -162,7 +167,20 @@ def main():
             all_distractors.append(F.normalize(dist_embeds.float(), dim=-1))
         distractor_embeddings = torch.cat(all_distractors, dim=0)
         print(f"Loaded {distractor_embeddings.shape[0]} distractor images")
-    
+
+    if args.baseline_only:
+        print("\nEvaluating baseline (CLIP similarity)...")
+        baseline_recalls = evaluate_baseline(
+            text_embeddings,
+            image_embeddings,
+            distractor_embeddings,
+            k_values=args.k_values
+        )
+        print("\n=== Baseline Results ===")
+        for metric, value in sorted(baseline_recalls.items()):
+            print(f"{metric}: {value:.4f}")
+        return
+
     print(f"\nLoading QuARI model from {args.checkpoint_path}")
     hypernetwork, metadata = load_model(args.checkpoint_path)
     
@@ -182,7 +200,7 @@ def main():
         print(f"{metric}: {value:.4f}")
     
     if args.eval_baseline:
-        print("\nEvaluating baseline...")
+        print("\nEvaluating baseline (CLIP similarity)...")
         baseline_recalls = evaluate_baseline(
             text_embeddings,
             image_embeddings,
