@@ -31,20 +31,41 @@ def expand_to_pairs(sample):
     Generator that expands one sample (image + multiple captions)
     into multiple (image, caption) pairs.
     """
-    # Decode image once
-    img_bytes = sample['jpg']
+    # Normalise sample formats so we can handle either:
+    #  - sample contains 'jpg' + 'json' where json has 'captions': [...]
+    #  - sample already represents a single caption with keys 'image' or 'jpg' and 'caption'
+    # Prefer explicit 'image' key if present (produced by other transforms), else use 'jpg'.
+    img_bytes = sample.get('image', sample.get('jpg'))
 
-    # Parse captions
+    # If the sample already contains a single caption field, yield it directly
+    if 'caption' in sample:
+        yield {
+            'image': img_bytes,
+            'caption': sample['caption'],
+            'image_id': sample.get('image_id', sample.get('__key__')),
+            'key': sample.get('__key__'),
+        }
+        return
+
+    # Otherwise parse the JSON payload which may contain 'captions' (list) or 'caption' (single)
     caption_data = json.loads(sample['json'].decode('utf-8'))
-    captions = caption_data['captions']
+    if 'captions' in caption_data:
+        captions = caption_data['captions']
+    elif 'caption' in caption_data:
+        captions = [caption_data['caption']]
+    else:
+        # Fallback: try to interpret the whole JSON as a text entry
+        captions = [str(caption_data)]
+
+    image_id = caption_data.get('image_id', sample.get('__key__'))
 
     # Yield one pair for each caption
     for caption in captions:
         yield {
             'image': img_bytes,
             'caption': caption,
-            'image_id': caption_data['image_id'],
-            'key': sample['__key__']
+            'image_id': image_id,
+            'key': sample.get('__key__'),
         }
 
 
@@ -55,6 +76,7 @@ def create_pair_dataloader(
     num_workers=4,
     image_size=224,
     expand_pairs=True,
+    return_image_ids=False,
     world_size=1,
     rank=0
 ):
@@ -68,16 +90,23 @@ def create_pair_dataloader(
         num_workers: Number of worker processes
         image_size: Size to resize images to
         expand_pairs: If True, yield (image, caption) pairs. If False, yield (image, all_captions)
+        return_image_ids: If True and expand_pairs=True, also return image_id per pair
         world_size: Total number of GPUs for distributed training
         rank: Current GPU rank for distributed training
     """
+
+    if return_image_ids and not expand_pairs:
+        raise ValueError("return_image_ids=True is only supported when expand_pairs=True")
 
     if expand_pairs:
         # Expand each image to multiple (image, caption) pairs
         def process_sample(sample):
             """Process and transform a single pair."""
-            # Decode image
-            img = Image.open(io.BytesIO(sample['image'])).convert('RGB')
+            # Decode image (support either 'image' or raw 'jpg' bytes)
+            img_bytes = sample.get('image', sample.get('jpg'))
+            img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+            if return_image_ids:
+                return img, sample['caption'], sample.get('image_id', sample.get('__key__'))
             return img, sample['caption']
 
         dataset = (
@@ -91,10 +120,16 @@ def create_pair_dataloader(
     else:
         # Keep image with all captions (original behavior)
         def process_sample_all(sample):
-            img_bytes = sample['jpg']
+            img_bytes = sample.get('image', sample.get('jpg'))
             img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
             caption_data = json.loads(sample['json'].decode('utf-8'))
-            return img, caption_data['captions']
+            if 'captions' in caption_data:
+                caps = caption_data['captions']
+            elif 'caption' in caption_data:
+                caps = [caption_data['caption']]
+            else:
+                caps = [str(caption_data)]
+            return img, caps
 
         dataset = (
             wds.WebDataset(dataset_pattern, shardshuffle=shuffle)
